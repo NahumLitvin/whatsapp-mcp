@@ -47,7 +47,21 @@ class MessageContext:
     before: List[Message]
     after: List[Message]
 
+WHATSMEOW_DB_PATH = os.path.join(os.path.dirname(MESSAGES_DB_PATH), 'whatsapp.db')
+
+def lid_to_phone(user: str) -> str:
+    try:
+        with sqlite3.connect(f"file:{WHATSMEOW_DB_PATH}?mode=ro", uri=True) as c:
+            row = c.execute("SELECT pn FROM whatsmeow_lid_map WHERE lid = ?", (user,)).fetchone()
+        return row[0] if row else user
+    except sqlite3.Error:
+        return user
+
 def get_sender_name(sender_jid: str) -> str:
+    user = sender_jid.split('@')[0]
+    pn = lid_to_phone(user)
+    if pn != user:
+        sender_jid = f"{pn}@s.whatsapp.net"
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
@@ -61,15 +75,15 @@ def get_sender_name(sender_jid: str) -> str:
         """, (sender_jid,))
         
         result = cursor.fetchone()
-        
+
         # If no result, try looking for the number within JIDs
-        if not result:
+        if not result or not result[0]:
             # Extract the phone number part if it's a JID
             if '@' in sender_jid:
                 phone_part = sender_jid.split('@')[0]
             else:
                 phone_part = sender_jid
-                
+
             cursor.execute("""
                 SELECT name
                 FROM chats
