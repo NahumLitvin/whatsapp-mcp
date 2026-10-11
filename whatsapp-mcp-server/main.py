@@ -11,6 +11,7 @@ from whatsapp import (
     get_message_context as whatsapp_get_message_context,
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
+    send_poll as whatsapp_send_poll,
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
 )
@@ -245,6 +246,19 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def send_poll(recipient: str, question: str, options: List[str], selectable_count: int = 0) -> Dict[str, Any]:
+    """Send a WhatsApp poll. selectable_count 0 = multiple choice (pick any), 1 = single choice. 2-12 options.
+
+    Args:
+        recipient: Phone number with country code (no +) or a JID
+        question: The poll question
+        options: List of 2-12 option strings
+        selectable_count: 0 for multi-select, 1 for single answer
+    """
+    success, status_message = whatsapp_send_poll(recipient, question, options, selectable_count)
+    return {"success": success, "message": status_message}
 
 if __name__ == "__main__":
     # Initialize and run the server

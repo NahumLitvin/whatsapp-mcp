@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"mime"
 	"net/http"
 	"os"
 	"os/signal"
@@ -292,7 +293,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// Document types (for any other file type)
 		default:
 			mediaType = whatsmeow.MediaDocument
-			mimeType = "application/octet-stream"
+			// Without a real mime type WhatsApp mobile renders the document as .bin
+			mimeType = mime.TypeByExtension("." + fileExt)
+			if mimeType == "" {
+				mimeType = "application/octet-stream"
+			}
 		}
 
 		switch mediaType {
@@ -371,6 +376,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
 				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				FileName:      proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -413,6 +419,36 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
 
+func sendWhatsAppPoll(client *whatsmeow.Client, messageStore *MessageStore, recipient, question string, options []string, selectableCount int) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+	var recipientJID types.JID
+	var err error
+	if strings.Contains(recipient, "@") {
+		recipientJID, err = types.ParseJID(recipient)
+		if err != nil {
+			return false, fmt.Sprintf("Error parsing JID: %v", err)
+		}
+	} else {
+		recipientJID = types.JID{User: recipient, Server: "s.whatsapp.net"}
+	}
+	// selectableCount 0 = multi-select (pick any number), 1 = single choice
+	msg := client.BuildPollCreation(question, options, selectableCount)
+	sendResp, err := client.SendMessage(context.Background(), recipientJID, msg)
+	if err != nil {
+		return false, fmt.Sprintf("Error sending poll: %v", err)
+	}
+	if messageStore != nil && client.Store.ID != nil {
+		chatJID := recipientJID.String()
+		now := time.Now()
+		_ = messageStore.TouchChat(chatJID, recipientJID.User, now)
+		_ = messageStore.StoreMessage(sendResp.ID, chatJID, client.Store.ID.User, "[poll] "+question+": "+strings.Join(options, " | "), now, true,
+			"", "", "", nil, nil, nil, 0)
+	}
+	return true, fmt.Sprintf("Poll sent to %s", recipient)
+}
+
 // Extract media info from a message
 func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
 	if msg == nil {
@@ -451,7 +487,59 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 }
 
 // Handle regular incoming messages with media support
+// Poll votes arrive encrypted; decrypt and store them as readable text so the MCP side can see answers.
+func handlePollVote(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) bool {
+	upd := msg.Message.GetPollUpdateMessage()
+	if upd == nil {
+		return false
+	}
+	vote, err := client.DecryptPollVote(context.Background(), msg)
+	if err != nil {
+		logger.Warnf("Failed to decrypt poll vote: %v", err)
+		return true
+	}
+	chatJID := msg.Info.Chat.String()
+	pollID := upd.GetPollCreationMessageKey().GetID()
+	var pollContent string
+	_ = messageStore.db.QueryRow("SELECT content FROM messages WHERE id = ? AND chat_jid = ?", pollID, chatJID).Scan(&pollContent)
+	question, options := pollID, []string{}
+	if strings.HasPrefix(pollContent, "[poll] ") {
+		if i := strings.Index(pollContent, ": "); i > 0 {
+			question = pollContent[7:i]
+			options = strings.Split(pollContent[i+2:], " | ")
+		}
+	}
+	hashes := whatsmeow.HashPollOptions(options)
+	var chosen []string
+	for _, sel := range vote.GetSelectedOptions() {
+		matched := false
+		for i, h := range hashes {
+			if bytes.Equal(h, sel) {
+				chosen = append(chosen, options[i])
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			chosen = append(chosen, fmt.Sprintf("<unknown %x>", sel[:4]))
+		}
+	}
+	content := fmt.Sprintf("[poll vote] %s -> %s", question, strings.Join(chosen, ", "))
+	if len(chosen) == 0 {
+		content = fmt.Sprintf("[poll vote] %s -> (cleared)", question)
+	}
+	_ = messageStore.StoreChat(chatJID, msg.Info.Chat.User, msg.Info.Timestamp)
+	if err := messageStore.StoreMessage(msg.Info.ID, chatJID, msg.Info.Sender.User, content, msg.Info.Timestamp, msg.Info.IsFromMe, "", "", "", nil, nil, nil, 0); err != nil {
+		logger.Warnf("Failed to store poll vote: %v", err)
+	}
+	fmt.Printf("[%s] %s: %s\n", msg.Info.Timestamp.Format("2006-01-02 15:04:05"), msg.Info.Sender.User, content)
+	return true
+}
+
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
+	if handlePollVote(client, messageStore, msg, logger) {
+		return
+	}
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
@@ -708,13 +796,7 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -763,6 +845,34 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Success: success,
 			Message: message,
 		})
+	})
+
+	// Handler for sending polls (multiple choice when selectable_count != 1)
+	http.HandleFunc("/api/send_poll", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Recipient       string   `json:"recipient"`
+			Question        string   `json:"question"`
+			Options         []string `json:"options"`
+			SelectableCount int      `json:"selectable_count"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Recipient == "" || req.Question == "" || len(req.Options) < 2 || len(req.Options) > 12 {
+			http.Error(w, "recipient, question and 2-12 options are required", http.StatusBadRequest)
+			return
+		}
+		success, message := sendWhatsAppPoll(client, messageStore, req.Recipient, req.Question, req.Options, req.SelectableCount)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
 	})
 
 	// Handler for downloading media

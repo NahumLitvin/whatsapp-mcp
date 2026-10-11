@@ -779,3 +779,20 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+def send_poll(recipient: str, question: str, options: List[str], selectable_count: int = 0) -> Tuple[bool, str]:
+    try:
+        if not recipient or not question or len(options) < 2:
+            return False, "recipient, question and at least 2 options are required"
+        response = requests.post(f"{WHATSAPP_API_BASE_URL}/send_poll", json={
+            "recipient": recipient,
+            "question": question,
+            "options": options,
+            "selectable_count": selectable_count,
+        })
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
